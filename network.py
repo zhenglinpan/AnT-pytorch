@@ -1,17 +1,38 @@
 import torch
 import torch.nn as nn
-import numpy
+import numpy as np
 
 
 class AnimationTransformer(nn.Module):
-    def __init__(self, in_nc=2, out_nc=256):
-        super(AnimationTransformer, self).__init__()
-        cnn = CNN(in_nc=in_nc, out_nc=out_nc)
-        mlp = MLP()
+    def __init__(self, embed_dim=256, head_num=4):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.head_num = head_num
+        self.layer_names = ['self', 'cross'] * 2
         
-    def forward(self, x):
-        pass
+        self.cnn = CNN(in_nc=2, out_nc=256)
+        self.fcn = KeypointEncoder(embed_dim)
+        self.gnn = AttentionalAggregation(embed_dim, head_num, self.layer_names)
 
+    def forward(self, ref, target, ref_bboxes, target_bboxes, labels):
+        """
+            M is the number of segments founded
+            :ref para: torchsize([M, 2, 32, 32])
+            :target para: torchsize([M, 2, 32, 32])
+            :ref_info: torchsize([M, 4])
+            :target_info: torchsize([M, 4])
+            :colors: torchsize([M, 1])
+        """
+        desc0 = self.cnn(ref) + self.fcn(ref_bboxes)  # torchsize([M, 256])
+        desc1 = self.cnn(target) + self.fcn(target_bboxes)    # torchsize([M, 256])
+        desc0, desc1 = self.gnn(desc0, desc1)   # torchsize([M, 256])
+        
+        sim_mat = desc0 @ desc1.transpose(1, 0) # torchsize([M, M])
+        sim_mat = nn.Softmax(sim_mat, dim=-1)   # softmax for each row
+        pred_color_ids = sim_mat @ labels # torchsize([M, 1])
+        
+        return pred_color_ids
+        
 
 class CNN(nn.Module):
     """
@@ -38,105 +59,128 @@ class CNN(nn.Module):
         x3 = self.conv3(x2).view(N, C, H*W)     # reshape to torchsize([N, C, 1024])
         out = self.conv_out(x3)
         return out
-
+        
 
 class MLP(nn.Module):
-    """
-    A trivial 3-layer MLP, in superGlue in *ref, conv1d(stride=1) is used instead
-    it is note worthy that conv1d and Linear might ensentially the same but could
-    have some numerical difference(implicit), in this implementation, Linear is used
-    ---
-    *ref link: https://github.com/pallashadow/SuperGlue-pytorch/blob/master/models/superglue.py
-    """
-    def __init__(self, ):
+    def __init__(self, feature_dims: list, bn=True):
         super(MLP, self).__init__()
         
-        self.linear1 = nn.Sequential(nn.Linear(4, 64),
-                                     nn.LeakyReLU(0.2, 1),
-                                     nn.BatchNorm1d(64))
-        self.linear2 = nn.Sequential(nn.Linear(64, 128),
-                                     nn.LeakyReLU(0.2, 1),
-                                     nn.BatchNorm1d(128))
-        self.linear3 = nn.Sequential(nn.Linear(128, 256))
+        layer_num = len(feature_dims)
+        model = []
+        for i in range(layer_num - 1):
+            model += [nn.Linear(feature_dims[i], feature_dims[i + 1])]
+            if i < layer_num - 1:
+                if bn: 
+                    model += [nn.BatchNorm2d(feature_dims[i + 1])]
+                model += [nn.LeakyReLU(0.2, 1)]
+        
+        self.model = nn.Sequential(*model)
 
     def forward(self, x):
-        x1 = self.linear1(x)
-        x2 = self.linear2(x1)
-        x3 = self.linear3(x2)
-        return x3
+        return self.model(x)
 
 
 def normalize_bbox(points): 
     pass
 
 
+class KeypointEncoder(nn.Module):
+    """
+        FCN in the paper
+    """
+    def __init__(self, embed_dim):
+        super(KeypointEncoder, self).__init__()
+        self.mlp = MLP([4, 32, 64, 128, embed_dim])
+        nn.init.constant_(self.mlp[-1].bias, 0.0)   # as per superGlue
+        
+    def forward(self, keypoints, color_ids):   # keypoints: torchsize([N, C, 4]), color_ids: torchsize([N, C, 1])
+        return self.mlp(torch.cat([keypoints, color_ids], dim=2))
 
-class Transformer(nn.Module):
-    """
-        Alternative Implementation of superGlue. Originals at 
-        https://github.com/pallashadow/SuperGlue-pytorch/blob/master/models/superglue.py
-    """
-    def __init__(self, ):
-        super(Transformer, self).__init__()
-        self.multihead_attention = MultiheadAttention(d_model=256, head_num=80)
+
+class AttentionalAggregation(nn.Module):
+    def __init__(self, embed_dim, head_num, layer_names):
+        super().__init__()
+        self.names = layer_names
+        self.trans_blocks = [AttentionalPropagation(embed_dim, head_num) for _ in range(len(layer_names))]
         
-    
-    def forward(self, x_ref, x_target):   # x_ref, x_target: torchsize([N, C, 256])
-        self_attn = self.multihead_attention(q=x_ref, k=x_ref, v=x_ref)
-        cross_attn = self.multihead_attention(q=x_ref, k=x_target, v=x_target)
+    def forward(self, desc_ref, desc_target): # desc_ref: torchsize([N, 256])
+        for trans_block, name in zip(self.trans_blocks, self.names):
+            if name == 'self':
+                ref, target = desc_ref, desc_target
+            elif name == 'cross':
+                ref, target = desc_target, desc_ref
+            
+            desc_ref = desc_ref + trans_block(desc_ref, ref)
+            desc_target = desc_target + trans_block(desc_target, target)
+            
+        return desc_ref, desc_target
+
+
+class AttentionalPropagation(nn.Module):
+    def __init__(self, embed_dim, head_num):
+        super().__init__()
+        self.multihead_attn = MultiheadAttention(embed_dim, head_num)
+        self.mlp = MLP([embed_dim*2, embed_dim*2, embed_dim])
         
-        
+    def forward(self, ref, target): # ref: torchsize([N, 256])
+        message = self.multihead_attn(q=ref, k=target, v=target)
+        return self.mlp(torch.cat([ref, message], dim=2))
+
 
 class MultiheadAttention(nn.Module):
-    def __init__(self, d_model=256, head_num=8):
+    def __init__(self, embed_dim, head_num=4):
         super(MultiheadAttention, self).__init__()
         self.head_num = head_num
-        self.d_model = d_model
-        self.dim = d_model // head_num
+        self.dim = embed_dim // head_num
+        self.embed_dim = embed_dim
         
-        self.attention = Attention()
+        self.attn = Attention()
+        self.w_q = nn.Linear(embed_dim, embed_dim)
+        self.w_k = nn.Linear(embed_dim, embed_dim)
+        self.w_v = nn.Linear(embed_dim, embed_dim)
+        self.w_o = nn.Linear(embed_dim, embed_dim)
         
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
-        self.w_concat = nn.Linear(d_model, d_model)
-        
-    def forward(self, q, k, v):
+    def forward(self, q, k, v): # x=q -> torchsize([N, 256]) as per paper
         q, k, v = self.w_q(q), self.w_k(k), self.w_v(v)
         q, k, v = self.split(q), self.split(k), self.split(v)
         
-        attn, _ = self.attention(q, k, v)     # torchsize([N, C, 8, 32])
+        v, _ = self.attn(q, k, v)
         
-        out = self.concat(attn) # torchsize([N, C, 256])
-        out = self.w_concat(out)  
+        o = self.merge(o)
+        out = self.w_o(v)
         
         return out
-        
+    
     def split(self, x):
-        """
-            x: torchsize([N, C, 256]) -> torchsize([N, C, 8, 32])
-        """
-        return x.view(x.shape[0], x.shape[1], self.head_num, self.dim)
-
-    def concat(self, x):
-        """
-            x: torchsize([N, C, 8, 32]) -> torchsize([N, C, 256])
-        """
-        N, C, HEAD, DIM = x.shape
-        return x.view(N, C, HEAD*DIM)
+        N, C, _ = x.shape
+        return x.view(N, C, self.head_num, self.dim)
+        
+    def merge(self, x):
+        N, C, _, _ = x.shape
+        return x.view(N, C, self.embed_dim)
 
 
 class Attention(nn.Module):
-    def __init__(self):
+    def __init__(self, ):
         super(Attention, self).__init__()
-        self.softmax = nn.Softmax(dim=-1)
         
-    def forward(self, q, k, v):
-        _, _, _, dim = k.shape   # [N, C, 8, 32]
-        score = q @ k.transpose(2, 3) / numpy.sqrt(dim)
+    def forward(self, q, k, v): # k: torchsize([N, C, 4, 64])
+        attn = nn.Softmax(q @ k.transpose(2, 3) / np.sqrt(k.shape[3]), dim=-1)
+        v = attn @ v
         
-        score = self.softmax(score)
-        v = score @ v
+        return v, attn
+
+
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, d_model, hidden, drop_prob=0.1):
+        super(PositionwiseFeedForward).__init__()
         
-        return v, score
+        self.linear1 = nn.Linear(d_model, hidden)
+        self.relu = nn.ReLU(1)
+        self.dropout = nn.Dropout(p=drop_prob)
+        self.linear2 = nn.Linear(hidden, d_model)
         
+    def forward(self, x):
+        x = self.dropout(self.relu(self.linear1(x)))
+        x = self.linear2(x)
+        return x
