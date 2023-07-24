@@ -4,7 +4,7 @@ This is an implementation of the paper [**The Animation Transformer: Visual Corr
 
 Albeit not finished, basic structures and the cores are done. 
 
-This project is not aim to re-implement results demonstrated in the paper since the dataset is not made public. Despite that I'm trying my best to rewrite the codes introduced by the authors, **THIS IMPLEMENTATION IS NOT GUARANTEED TO BE CORRECT**, but you're welcome to do modications on the code and sumbit and issues found.
+This project is not aim to re-implement results demonstrated in the paper since the dataset is not made public. Despite that I'm trying my best to rewrite the codes introduced by the authors, **THIS IMPLEMENTATION IS NOT GUARANTEED TO BE CORRECT**, but you're welcome to do modications on the code and sumbit any issues found.
 
 
 
